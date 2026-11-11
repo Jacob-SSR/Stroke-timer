@@ -1,0 +1,2304 @@
+"use client";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  Activity,
+  ArrowRight,
+  Check,
+  Clock3,
+  Download,
+  FileText,
+  Brain,
+  LayoutDashboard,
+  LoaderCircle,
+  Plus,
+  RefreshCw,
+  Search,
+  Settings2,
+  ShieldCheck,
+  Timer,
+  X,
+  AlertTriangle,
+} from "lucide-react";
+import {
+  defaults,
+  duration,
+  inRange,
+  metrics,
+  steps,
+  summary,
+  thaiDate,
+  thaiTime,
+  type Case,
+  type Patient,
+  type Rca,
+  type Snapshot,
+  type TargetKey,
+  type TimeKey,
+} from "@/lib/model";
+import StrokeAssessment from "./stroke-assessment";
+import StrokeOutcome from "./stroke-outcome";
+import OutcomeDashboard from "./outcome-dashboard";
+import SoundToggle from "./sound-toggle";
+import ModalShell from "./modal-shell";
+import InlineTime from "./inline-time";
+import LabPanel from "./lab-panel";
+import HistoryPanel from "./history-panel";
+import {
+  dateRange,
+  stepDetails,
+  symptomPresets,
+  delayPresets,
+  rcaLabel,
+} from "@/lib/workflow";
+type Command = Record<string, unknown>;
+type Modal =
+  | "er"
+  | "refer"
+  | "outcome"
+  | "rca"
+  | "summary"
+  | "settings"
+  | "ekg"
+  | "time"
+  | "close"
+  | "discard"
+  | "clearLog"
+  | null;
+const metricNames = {
+  md: "ถึงโรงพยาบาล → แพทย์ตรวจ",
+  dtx: "ถึงโรงพยาบาล → เจาะ DTX",
+  consult: "ถึงโรงพยาบาล → ประสานปลายทาง",
+  dido: "ถึงโรงพยาบาล → รถออก",
+};
+const targetNames: Record<TargetKey, string> = {
+  md: "แพทย์ตรวจ",
+  dtx: "เจาะ DTX",
+  ekg: "EKG 12 lead",
+  lab_sent: "ส่ง Lab",
+  consult: "โทรประสาน รพ.ปลายทาง",
+  accept: "ปลายทางรับ Refer",
+  ambu: "รถ Refer พร้อม",
+  dido: "รถออกจากโรงพยาบาล",
+};
+function inputTime(t: number | null) {
+  return t == null ? "" : new Date(t + 7 * 3600000).toISOString().slice(0, 19);
+}
+function parseTime(s: string) {
+  return s ? Date.parse(s + "+07:00") : null;
+}
+async function request(
+  action = "state",
+  body?: Command,
+  query: Record<string, string> = {},
+) {
+  const r = await fetch(
+    "/api/stroke?" + new URLSearchParams({ action, ...query }),
+    {
+      cache: "no-store",
+      ...(body
+        ? {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }
+        : {}),
+    },
+  );
+  const j = await r.json();
+  if (!r.ok)
+    throw Object.assign(new Error(j.error || "เชื่อมต่อไม่สำเร็จ"), {
+      status: r.status,
+    });
+  return j;
+}
+export default function Workspace() {
+  const [s, setS] = useState<Snapshot | null>(null),
+    [selected, setSelected] = useState(""),
+    [tab, setTab] = useState("timer");
+  const [now, setNow] = useState<number | null>(null),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false),
+    [login, setLogin] = useState(false),
+    [connected, setConnected] = useState(false);
+  const [token, setToken] = useState(""),
+    [modal, setModal] = useState<Modal>(null),
+    [modalId, setModalId] = useState(""),
+    [toast, setToast] = useState("");
+  const [patients, setPatients] = useState<Patient[]>([]),
+    [search, setSearch] = useState(""),
+    [linking, setLinking] = useState(false);
+  const [from, setFrom] = useState(""),
+    [to, setTo] = useState(""),
+    [pathFilter, setPathFilter] = useState("all");
+  const [note, setNote] = useState(""),
+    [important, setImportant] = useState(false),
+    [hide, setHide] = useState(true);
+  const [editingTime, setEditingTime] = useState<{
+    key: TimeKey;
+    label: string;
+    value: string;
+  } | null>(null);
+  const [erLoading, setErLoading] = useState(false);
+  const [erFrom, setErFrom] = useState(""),
+    [erTo, setErTo] = useState("");
+  const [erSearched, setErSearched] = useState(false),
+    [erHasMore, setErHasMore] = useState(false);
+  const erRequest = useRef(0);
+  const [clearText, setClearText] = useState("");
+  const [clearIds, setClearIds] = useState<string[]>([]);
+  const noteInput = useRef<HTMLInputElement>(null);
+  const offset = useRef(0),
+    inFlight = useRef(false),
+    frame = useRef<HTMLIFrameElement>(null);
+  const update = useCallback((j: Snapshot) => {
+    offset.current = j.serverNow - Date.now();
+    setNow(Date.now() + offset.current);
+    setS(j);
+    setConnected(true);
+    setLogin(false);
+  }, []);
+  const sync = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    try {
+      update(await request());
+    } catch (e) {
+      setConnected(false);
+      setError((e as Error).message);
+      if ((e as { status?: number }).status === 401) setLogin(true);
+    } finally {
+      inFlight.current = false;
+    }
+  }, [update]);
+  useEffect(() => {
+    void sync();
+    const range = dateRange("month");
+    setFrom(range.from);
+    setTo(range.to);
+    const p = setInterval(() => void sync(), 10000);
+    const t = setInterval(() => setNow(Date.now() + offset.current), 1000);
+    return () => {
+      clearInterval(p);
+      clearInterval(t);
+    };
+  }, [sync]);
+  useEffect(() => {
+    if (toast) {
+      const t = setTimeout(() => setToast(""), 3500);
+      return () => clearTimeout(t);
+    }
+  }, [toast]);
+  const op = useCallback(
+    async (cmd: Command) => {
+      setBusy(true);
+      setError("");
+      inFlight.current = true;
+      try {
+        update(await request("op", cmd));
+        setToast(
+          cmd.op === "discard" ? "นำรายการที่เลือกผิดออกแล้ว" : "บันทึกแล้ว",
+        );
+        return true;
+      } catch (e) {
+        setError((e as Error).message);
+        return false;
+      } finally {
+        setBusy(false);
+        inFlight.current = false;
+      }
+    },
+    [update],
+  );
+  const active = s?.cases.find((c) => c.id === selected) || s?.cases[0];
+  const mc = [...(s?.cases || []), ...(s?.log || [])].find(
+    (c) => c.id === modalId,
+  );
+  const open = (m: Modal, c?: Case) => {
+    setModal(m);
+    setModalId(c?.id || "");
+    setHide(true);
+    setError("");
+  };
+  const editTime = (c: Case, key: TimeKey, label: string) => {
+    setEditingTime({ key, label, value: inputTime(c.times[key].t) });
+    open("time", c);
+  };
+  useEffect(() => {
+    async function onMessage(e: MessageEvent) {
+      if (
+        e.origin !== location.origin ||
+        e.source !== frame.current?.contentWindow ||
+        modal !== "ekg" ||
+        !mc
+      )
+        return;
+      if (e.data?.type === "stroke-ekg-close") setModal(null);
+      if (e.data?.type === "stroke-ekg-result" && e.data.caseId === mc.id) {
+        const r = e.data.result;
+        if (
+          await op({
+            op: "ekg",
+            id: mc.id,
+            value: {
+              report: String(r.report || "").slice(0, 4000),
+              impression: Array.isArray(r.impression)
+                ? r.impression
+                    .slice(0, 6)
+                    .map((x: unknown) => String(x).slice(0, 300))
+                : [],
+              urgency: ["critical", "urgent", "routine"].includes(r.urgency)
+                ? r.urgency
+                : "urgent",
+              model: String(r.model || "").slice(0, 100),
+            },
+          })
+        )
+          setModal(null);
+      }
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [modal, mc, op]);
+  async function searchEr(from: string, to: string) {
+    const ticket = ++erRequest.current;
+    setError("");
+    setPatients([]);
+    setErLoading(true);
+    setErSearched(false);
+    setErHasMore(false);
+    try {
+      const response = await request("er", undefined, { from, to });
+      if (ticket !== erRequest.current) return;
+      setPatients(response.list);
+      setErHasMore(response.hasMore);
+      setErSearched(true);
+    } catch (e) {
+      if (ticket === erRequest.current) setError((e as Error).message);
+    } finally {
+      if (ticket === erRequest.current) setErLoading(false);
+    }
+  }
+  function changeErDates(from: string, to: string) {
+    ++erRequest.current;
+    setErFrom(from);
+    setErTo(to);
+    setPatients([]);
+    setErHasMore(false);
+    setErSearched(false);
+    setErLoading(false);
+    setError("");
+  }
+  async function openEr(link = false) {
+    setLinking(link);
+    setSearch("");
+    setModal("er");
+    setModalId(active?.id || "");
+    const today = thaiDate(now ?? Date.now()),
+      from = erFrom || today,
+      to = erTo || today;
+    setErFrom(from);
+    setErTo(to);
+    await searchEr(from, to);
+  }
+  async function addCase() {
+    if (await op({ op: "new" })) setSelected("");
+  }
+  const exportUrl = (action: string, c?: Case, kind?: string) =>
+    "/api/stroke?" +
+    new URLSearchParams({
+      action,
+      ...(c ? { id: c.id } : {}),
+      ...(kind ? { kind } : {}),
+      from,
+      to,
+      path: pathFilter,
+      search,
+    });
+  const records = (s?.log || []).filter(
+    (c) =>
+      inRange(c, from, to) &&
+      (pathFilter === "all" || c.path === pathFilter) &&
+      (!search ||
+        `${c.label} ${c.hn} ${c.vn}`
+          .toLowerCase()
+          .includes(search.toLowerCase())),
+  );
+  const history = s ? (
+    <HistoryPanel
+      s={s}
+      records={records}
+      from={from}
+      to={to}
+      path={pathFilter}
+      search={search}
+      busy={busy}
+      setFrom={setFrom}
+      setTo={setTo}
+      setPath={setPathFilter}
+      setSearch={setSearch}
+      exportUrl={exportUrl}
+      onOpen={(m, c) => open(m, c)}
+      onClear={() => {
+        setClearText("");
+        setClearIds(s.log.map((c) => c.id));
+        open("clearLog");
+      }}
+      onResend={() =>
+        void op({
+          op: "resend",
+          ...(from ? { from } : {}),
+          ...(to ? { to } : {}),
+        })
+      }
+      onReopen={(c) => {
+        if (confirm("เปิดเคสนี้กลับมาติดตาม?"))
+          void op({ op: "reopen", id: c.id });
+      }}
+    />
+  ) : null;
+  const setField = (c: Case, field: string, value: unknown) =>
+    op({ op: "set", id: c.id, field, value });
+  if (login)
+    return (
+      <main className="login">
+        <div className="brandmark">
+          <Brain size={32} />
+        </div>
+        <h1>STROKE Fast Track</h1>
+        <p>เข้าสู่ระบบสำหรับบุคลากรโรงพยาบาล</p>
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            try {
+              await request("op", { op: "login", token });
+              setError("");
+              await sync();
+            } catch (e) {
+              setError((e as Error).message);
+            }
+          }}
+        >
+          <label>
+            รหัสเข้าใช้งาน
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              autoComplete="current-password"
+              required
+            />
+          </label>
+          <button className="primary">
+            เข้าสู่ระบบ <ArrowRight size={16} />
+          </button>
+        </form>
+        {error && <p className="danger">{error}</p>}
+      </main>
+    );
+  return (
+    <div className="app">
+      <a className="skip-link" href="#main-content">
+        ข้ามไปเนื้อหาหลัก
+      </a>
+      <aside className="sidebar">
+        <a className="brand" href="/">
+          <span className="brandmark">
+            <Brain />
+          </span>
+          <span>
+            STROKE<span className="brand-sub">FAST TRACK</span>
+          </span>
+        </a>
+        <div className="sidebar-label">ระบบดูแลผู้ป่วย</div>
+        <nav aria-label="เมนูหลัก">
+          {[
+            ["timer", "ติดตามผู้ป่วย", Timer],
+            ["dashboard", "สรุปผลการดูแล", LayoutDashboard],
+            ["history", "เคสที่ปิดแล้ว", FileText],
+          ].map(([key, name, Icon]) => (
+            <button
+              key={String(key)}
+              aria-label={String(name)}
+              aria-current={tab === key ? "page" : undefined}
+              className={tab === key ? "nav active" : "nav"}
+              onClick={() => {
+                setTab(String(key));
+                setSearch("");
+              }}
+            >
+              {typeof Icon !== "string" && <Icon size={19} />}
+              <span>{String(name)}</span>
+              {key === "timer" && <b>{s?.cases.length || 0}</b>}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="read-only">
+            <ShieldCheck size={18} />
+            <span>
+              HOSxP อ่านอย่างเดียว<small>ไม่แก้ไขข้อมูลใน HOSxP</small>
+            </span>
+          </div>
+          <button
+            className="nav"
+            onClick={() => open("settings")}
+            aria-label="ตั้งค่าระบบ"
+          >
+            <Settings2 size={18} />
+            ตั้งค่าระบบ
+          </button>
+          <div className="hospital-mini">
+            ห้องฉุกเฉิน
+            <small>{s?.hospital || "STROKE Fast Track"}</small>
+          </div>
+        </div>
+      </aside>
+      <div className="main">
+        <header className="topbar">
+          <div className="breadcrumb">
+            ห้องฉุกเฉิน <span>/</span>{" "}
+            <b>
+              {tab === "timer"
+                ? "ติดตามผู้ป่วย"
+                : tab === "dashboard"
+                  ? "สรุปผลการดูแล"
+                  : "เคสที่ปิดแล้ว"}
+            </b>
+          </div>
+          <div className="top-right">
+            <span className={"connection " + (connected ? "" : "offline")}>
+              <i />
+              {connected ? "เชื่อมต่อแล้ว" : "ขาดการเชื่อมต่อ"}
+            </span>
+            <span className="clock">{thaiTime(now)}</span>
+            <span className="avatar">ER</span>
+            <button
+              className="mobile-settings"
+              aria-label="ตั้งค่าระบบ"
+              onClick={() => open("settings")}
+            >
+              <Settings2 size={18} />
+              <span>ตั้งค่า</span>
+            </button>
+          </div>
+        </header>
+        <main className="content" id="main-content" tabIndex={-1}>
+          <div className="page-heading">
+            <div>
+              <div className="eyebrow">STROKE FAST TRACK · ห้องฉุกเฉิน</div>
+              <h1>
+                {tab === "timer"
+                  ? "ติดตามการดูแลผู้ป่วย"
+                  : tab === "dashboard"
+                    ? "ภาพรวมคุณภาพการดูแล"
+                    : "ทะเบียนเคส STROKE"}
+              </h1>
+              <p>
+                {tab === "timer"
+                  ? "เลือกผู้ป่วย แล้วบันทึกเวลาที่ทำแต่ละขั้นตอนจริง"
+                  : "ติดตามตัวชี้วัดและทบทวนผลการดูแลผู้ป่วย"}
+              </p>
+            </div>
+            <div className="heading-actions">
+              <button onClick={() => void sync()} aria-label="อัปเดตข้อมูล">
+                <RefreshCw size={16} />
+                <span>อัปเดต</span>
+              </button>
+              {tab === "timer" && (
+                <button className="primary" onClick={() => void openEr()}>
+                  <Plus size={17} />
+                  เลือกผู้ป่วยจาก HOSxP
+                </button>
+              )}
+            </div>
+          </div>
+          {s?.demo && (
+            <div className="demo-banner">
+              <span>
+                <span className="demo-dot" />
+                โหมดตัวอย่าง
+              </span>
+              ข้อมูลผู้ป่วยสมมติสำหรับทดลอง · ยังไม่เชื่อม HOSxP จริง
+            </div>
+          )}
+          {error && (
+            <div className="error-banner" role="alert">
+              <AlertTriangle size={18} />
+              {error}
+              <button onClick={() => setError("")} aria-label="ปิดข้อความ">
+                <X size={16} />
+              </button>
+            </div>
+          )}
+          {!s ? (
+            <div className="empty">
+              <LoaderCircle className="spin" />
+              <h2>กำลังเชื่อมต่อระบบ</h2>
+              <button onClick={() => void sync()}>ลองใหม่</button>
+            </div>
+          ) : tab === "timer" ? (
+            <>
+              <div className="case-tabs">
+                {s.cases.map((c) => (
+                  <div className="case-tab-wrap" key={c.id}>
+                    <button
+                      className={
+                        "case-tab " + (active?.id === c.id ? "selected" : "")
+                      }
+                      onClick={() => setSelected(c.id)}
+                      aria-pressed={active?.id === c.id}
+                    >
+                      <span className="patient-dot" />
+                      <span>
+                        <b>{c.label}</b>
+                        <small>
+                          HN {c.hn || "รอลงทะเบียน"} · ผ่านไป{" "}
+                          {duration(
+                            (c.times.door_out.t ?? now ?? 0) -
+                              (c.times.door_in.t ?? now ?? 0),
+                          )}
+                        </small>
+                      </span>
+                      {active?.id === c.id && (
+                        <span className="live-pill">กำลังติดตาม</span>
+                      )}
+                    </button>
+                    <button
+                      className="remove-case-button"
+                      aria-label={"นำ " + c.label + " ออกจากหน้าติดตาม"}
+                      title="เลือกผู้ป่วยผิด? ปิดรายการนี้"
+                      disabled={busy || !connected}
+                      onClick={() => open("discard", c)}
+                    >
+                      <X size={18} aria-hidden="true" />
+                    </button>
+                  </div>
+                ))}
+                <button
+                  className="new-case"
+                  onClick={() => void addCase()}
+                  disabled={busy}
+                >
+                  <Plus size={18} />
+                  มาถึงก่อนลงทะเบียน
+                </button>
+              </div>
+              {!active ? (
+                <div className="empty">
+                  <Brain size={38} />
+                  <h2>พร้อมรับผู้ป่วย Fast Track</h2>
+                  <p>เลือกผู้ป่วยจาก HOSxP หรือเริ่มจับเวลาก่อนลงทะเบียน</p>
+                </div>
+              ) : (
+                <>
+                  <div className="patient-strip">
+                    <div className="patient-icon">
+                      <Brain size={25} />
+                    </div>
+                    <div>
+                      <h2>{active.label}</h2>
+                      <p>
+                        HN {active.hn || "—"} <span>·</span>{" "}
+                        {active.patient?.sex ||
+                          active.assessment.sex ||
+                          "ยังไม่ระบุเพศ"}{" "}
+                        <span>·</span>{" "}
+                        {active.patient?.age ?? (active.assessment.age || "—")}{" "}
+                        ปี <span>·</span>{" "}
+                        {active.patient?.pttype || "รอลงทะเบียน"}
+                      </p>
+                    </div>
+                    <div className="patient-strip-right">
+                      <span className="diagnosis">
+                        {active.patient?.dx || "รอยืนยันการวินิจฉัย"}
+                      </span>
+                      <span className="tag">
+                        {active.vn ? "HOSxP" : "บันทึกเอง"}
+                      </span>
+                    </div>
+                  </div>
+                  {active.notes.some((n) => n.important) && (
+                    <div className="error-banner">
+                      <AlertTriangle size={18} />
+                      {active.notes
+                        .filter((n) => n.important)
+                        .map((n) => n.text)
+                        .join(" · ")}
+                    </div>
+                  )}
+                  <div className="care-tools">
+                    <SoundToggle cases={s.cases} />
+                    <span className="muted">
+                      แจ้งเตือนเมื่อมีบันทึกสำคัญใหม่
+                    </span>
+                  </div>
+                  <div className="timers">
+                    <div className="timer-card door">
+                      <div className="timer-top">
+                        <span>
+                          <Clock3 size={17} />
+                          เวลาตั้งแต่มาถึงโรงพยาบาล
+                        </span>
+                        <span className="live-indicator">
+                          <i />
+                          {active.times.door_out.t
+                            ? "ส่งต่อแล้ว"
+                            : "กำลังนับเวลา"}
+                        </span>
+                      </div>
+                      <div className="timer-number">
+                        {duration(
+                          (active.times.door_out.t ?? now ?? 0) -
+                            (active.times.door_in.t ?? now ?? 0),
+                        )}
+                      </div>
+                      <div className="timer-footer">
+                        {active.times.door_out.t
+                          ? "นับถึงเวลาส่งต่อ"
+                          : "เริ่มรับผู้ป่วย"}{" "}
+                        <b>{thaiTime(active.times.door_in.t)}</b>
+                        <button
+                          onClick={() =>
+                            editTime(
+                              active,
+                              "door_in",
+                              "มาถึงโรงพยาบาล (Door-in)",
+                            )
+                          }
+                        >
+                          แก้ไขเวลา
+                        </button>
+                      </div>
+                    </div>
+                    <div className="timer-card onset">
+                      <div className="timer-top">
+                        <span>
+                          <Activity size={17} />
+                          เวลาตั้งแต่เริ่มมีอาการ
+                        </span>
+                        <span className="tag">เริ่มมีอาการ</span>
+                      </div>
+                      <div className="timer-number">
+                        {active.onset && !active.onsetUnknown
+                          ? duration((now ?? 0) - active.onset)
+                          : active.onsetUnknown
+                            ? "ไม่ทราบเวลา"
+                            : "ยังไม่ระบุเวลา"}
+                      </div>
+                      <div className="timer-footer">
+                        {active.onsetUnknown
+                          ? "ไม่ทราบเวลาเริ่มอาการ"
+                          : active.onset
+                            ? thaiTime(active.onset, true)
+                            : "ระบุเวลาเริ่มอาการในข้อมูลผู้ป่วย"}
+                        <span className="muted">แสดงเวลาที่ผ่านไป</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="metric-grid">
+                    {(Object.keys(metricNames) as TargetKey[]).map((key) => {
+                      const k = key as keyof typeof metricNames;
+                      const value = metrics(active)[k],
+                        done = value != null,
+                        na = false;
+                      const elapsed = minutesSince(active.times.door_in.t, now);
+                      const late = !na && (value ?? elapsed) > s.targets[k];
+                      return (
+                        <div
+                          className={
+                            "metric-card " +
+                            (late ? "late" : done ? "complete" : "")
+                          }
+                          key={k}
+                        >
+                          <div className="metric-title">
+                            {metricNames[k]}
+                            <span
+                              className={
+                                "status-icon " + (done && !late ? "good" : "")
+                              }
+                            >
+                              {done ? (
+                                <Check size={14} />
+                              ) : (
+                                <Clock3 size={14} />
+                              )}
+                            </span>
+                          </div>
+                          <div className="metric-value">
+                            {na
+                              ? "ไม่ให้ยา"
+                              : done
+                                ? value.toFixed(1)
+                                : Math.floor(elapsed)}
+                            {!na && <small>นาที</small>}
+                          </div>
+                          <div className="progress-track">
+                            <div
+                              style={{
+                                width:
+                                  Math.min(
+                                    100,
+                                    ((value ?? elapsed) / s.targets[k]) * 100,
+                                  ) + "%",
+                              }}
+                            />
+                          </div>
+                          <div className="metric-caption">
+                            <span>เป้า ≤ {s.targets[k]} นาที</span>
+                            <b>
+                              {na
+                                ? "ไม่นำมาคิด"
+                                : done
+                                  ? late
+                                    ? "เกินเป้า"
+                                    : "ผ่านเป้า"
+                                  : late
+                                    ? "เกินเป้า · รอดำเนินการ"
+                                    : "กำลังติดตาม"}
+                            </b>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="care-grid">
+                    <section className="panel patient-panel">
+                      <div className="panel-heading">
+                        <h2>ข้อมูลผู้ป่วย</h2>
+                        <span className="tag">บันทึกอัตโนมัติ</span>
+                      </div>
+                      <div className="panel-body">
+                        <div className="detail-block">
+                          <label>
+                            อาการสำคัญ <span className="source">HOSxP</span>
+                          </label>
+                          <p>{active.patient?.cc || "ยังไม่มีข้อมูล"}</p>
+                        </div>
+                        <div className="detail-block">
+                          <label>ประวัติปัจจุบัน / โรคประจำตัว</label>
+                          <p>{active.patient?.hpi || "—"}</p>
+                          <small>{active.patient?.pmh || "—"}</small>
+                        </div>
+                        {!active.vn && (
+                          <>
+                            <EditField
+                              label="ชื่อ / ป้ายกำกับ"
+                              value={active.label}
+                              save={(v) => setField(active, "label", v)}
+                            />
+                            <EditField
+                              label="HN"
+                              value={active.hn}
+                              save={(v) => setField(active, "hn", v)}
+                            />
+                            <button
+                              className="full"
+                              onClick={() => void openEr(true)}
+                            >
+                              ผูกกับ VN ใน HOSxP
+                            </button>
+                          </>
+                        )}
+                        <label className="field">
+                          เวลาเริ่มอาการ / Last known well (LKW)
+                          <input
+                            type="datetime-local"
+                            step="1"
+                            key={active.id + "onset" + active.onset}
+                            defaultValue={inputTime(active.onset)}
+                            onBlur={(e) => {
+                              const v = parseTime(e.target.value);
+                              if (v !== active.onset)
+                                void setField(active, "onset", v);
+                            }}
+                          />
+                        </label>
+                        <label className="checkbox">
+                          <input
+                            type="checkbox"
+                            checked={active.onsetUnknown}
+                            onChange={(e) =>
+                              void setField(
+                                active,
+                                "onsetUnknown",
+                                e.target.checked,
+                              )
+                            }
+                          />
+                          ไม่ทราบเวลาเริ่มอาการ
+                        </label>
+                        <label className="field">
+                          มาโดย
+                          <select
+                            value={active.arrive}
+                            onChange={(e) =>
+                              void setField(active, "arrive", e.target.value)
+                            }
+                          >
+                            {["มาเอง", "EMS 1669", "รับส่งต่อ", "อื่น ๆ"].map(
+                              (v) => (
+                                <option key={v}>{v}</option>
+                              ),
+                            )}
+                          </select>
+                        </label>
+                        <label className="field">
+                          แนวทางการรักษา
+                          <select
+                            value={active.path}
+                            onChange={(e) =>
+                              void setField(active, "path", e.target.value)
+                            }
+                          >
+                            <option value="refer">
+                              ส่งต่อ Stroke Fast Track
+                            </option>
+                            <option value="local">ดูแลที่โรงพยาบาล</option>
+                          </select>
+                        </label>
+                        <EditField
+                          label="โรงพยาบาลปลายทาง"
+                          value={active.dest}
+                          save={(v) => setField(active, "dest", v)}
+                          list={s.hospitals}
+                        />
+                        <StrokeAssessment
+                          key={active.id}
+                          c={active}
+                          busy={busy || !connected}
+                          op={op}
+                          now={now ?? s.serverNow}
+                        />
+                      </div>
+                    </section>
+                    <section className="panel timeline-panel">
+                      <div className="panel-heading">
+                        <div>
+                          <h2>ลำดับการดูแล Fast Track</h2>
+                          <button
+                            className="timeline-ekg"
+                            onClick={() => open("ekg", active)}
+                          >
+                            <Activity size={16} />
+                            อ่าน EKG ด้วย AI
+                          </button>
+                          <p>
+                            กด “บันทึกตอนนี้” เมื่อทำขั้นตอนนั้นแล้ว ·
+                            หรือกรอกเวลาในช่องได้เลย (บันทึกเมื่อออกจากช่อง)
+                          </p>
+                        </div>
+                        <span className="tag">
+                          {steps.filter(([k]) => active.times[k].t).length} /{" "}
+                          {steps.length}
+                          ขั้นตอน
+                        </span>
+                      </div>
+                      <div className="timeline">
+                        {steps.map(([key, name], i) => {
+                          const t = active.times[key],
+                            target =
+                              key === "door_out"
+                                ? s.targets.dido
+                                : s.targets[key],
+                            elapsed = minutesSince(
+                              active.times.door_in.t,
+                              t.t ?? now,
+                            ),
+                            skip = false,
+                            late = !skip && elapsed > target;
+                          return (
+                            <div
+                              className={
+                                "timeline-row " +
+                                (t.t ? "done " : "") +
+                                (skip ? "skipped " : late ? "overdue" : "")
+                              }
+                              key={key}
+                            >
+                              <div className="step-circle">
+                                {t.t ? (
+                                  <Check size={14} />
+                                ) : (
+                                  String(i + 1).padStart(2, "0")
+                                )}
+                              </div>
+                              <div className="step-info">
+                                <b>{name}</b>
+                                <small>
+                                  {`เป้า ≤ ${target} นาที`}
+                                  {t.src && (
+                                    <span className="source">
+                                      {t.src === "hosxp" ? "HOSxP" : "กดเอง"}
+                                    </span>
+                                  )}
+                                </small>
+                                <small>{stepDetails[key]}</small>
+                                {t.hosxp && t.src === "manual" && (
+                                  <small>HOSxP {thaiTime(t.hosxp)}</small>
+                                )}
+                              </div>
+                              <div className="step-time">
+                                {skip ? (
+                                  <span className="muted">N/A</span>
+                                ) : t.t ? (
+                                  <>
+                                    <b>{thaiTime(t.t)}</b>
+                                    <small
+                                      className={late ? "danger" : "success"}
+                                    >
+                                      {elapsed.toFixed(1)} นาที ·{" "}
+                                      {late ? "เกินเป้า" : "ผ่านเป้า"}
+                                    </small>
+                                  </>
+                                ) : (
+                                  <small className={late ? "danger" : "muted"}>
+                                    {late
+                                      ? `เลยเป้า ${Math.ceil(elapsed - target)} นาที`
+                                      : `เหลือ ${Math.ceil(target - elapsed)} นาที`}
+                                  </small>
+                                )}
+                              </div>
+                              <div className="step-actions">
+                                <InlineTime
+                                  key={active.id + key}
+                                  label={name}
+                                  time={t.t}
+                                  now={now ?? s.serverNow}
+                                  disabled={busy || skip || !connected}
+                                  save={(t) =>
+                                    op({ op: "stamp", id: active.id, key, t })
+                                  }
+                                />
+                                {t.t ? (
+                                  <span className="recorded-label">
+                                    <Check size={16} />
+                                    บันทึกแล้ว
+                                  </span>
+                                ) : (
+                                  <button
+                                    disabled={busy || skip || !connected}
+                                    className="stamp-button"
+                                    onClick={() =>
+                                      void op({
+                                        op: "stamp",
+                                        id: active.id,
+                                        key,
+                                        t: Date.now() + offset.current,
+                                      })
+                                    }
+                                  >
+                                    <Plus size={16} />
+                                    บันทึกตอนนี้
+                                  </button>
+                                )}
+                                <button
+                                  className="icon-button"
+                                  aria-label={"แก้เวลา " + name}
+                                  disabled={busy || skip}
+                                  onClick={() => editTime(active, key, name)}
+                                >
+                                  <Settings2 size={14} />
+                                  แก้เวลา
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  </div>
+                  <div className="bottom-grid">
+                    <LabPanel
+                      c={active}
+                      names={s.labNames}
+                      now={now ?? s.serverNow}
+                    />
+                    <section className="panel">
+                      <div className="panel-heading">
+                        <h2>ผลอ่าน EKG</h2>
+                        <button onClick={() => open("ekg", active)}>
+                          <Activity size={15} />
+                          อ่าน EKG
+                        </button>
+                      </div>
+                      <div className="panel-body">
+                        {active.ekgs.length ? (
+                          active.ekgs.map((e, i) => (
+                            <div key={e.t} className="ekg-result">
+                              <p>{e.impression.join("; ")}</p>
+                              <small>
+                                {e.model} · {thaiTime(e.t)}
+                              </small>
+                              <p className={e.confirmed ? "success" : "danger"}>
+                                {e.confirmed
+                                  ? "แพทย์ยืนยันแล้ว"
+                                  : "รอแพทย์ยืนยันผล"}
+                              </p>
+                              {!e.confirmed && (
+                                <button
+                                  onClick={() =>
+                                    void op({
+                                      op: "confirmEkg",
+                                      id: active.id,
+                                      index: i,
+                                    })
+                                  }
+                                >
+                                  แพทย์ยืนยันผล
+                                </button>
+                              )}
+                            </div>
+                          ))
+                        ) : (
+                          <p className="muted">
+                            แนบภาพ / PDF และอ่านผลด้วย AI ภายในโรงพยาบาล
+                            <br />
+                            ผล AI ต้องได้รับการยืนยันจากแพทย์
+                          </p>
+                        )}
+                      </div>
+                    </section>
+                  </div>
+                  <section className="panel notes-panel">
+                    <div className="panel-heading">
+                      <h2>อาการเปลี่ยนแปลง / หมายเหตุ</h2>
+                      <span className="tag">
+                        ทุกบันทึกมีเวลา · ติ๊ก “สำคัญ” เพื่อแจ้งเตือน
+                      </span>
+                    </div>
+                    <div className="panel-body">
+                      {active.notes.length > 0 && (
+                        <div className="notes-list">
+                          {active.notes.map((n) => (
+                            <div
+                              className={n.important ? "important-note" : ""}
+                              key={n.id}
+                            >
+                              <time>{thaiTime(n.t)}</time>
+                              <span>
+                                {n.important && <AlertTriangle size={14} />}{" "}
+                                {n.text}
+                              </span>
+                              <button
+                                className="note-delete"
+                                disabled={busy}
+                                aria-label={"ลบหมายเหตุ " + n.text}
+                                onClick={() => {
+                                  if (confirm("ลบหมายเหตุนี้?\n" + n.text))
+                                    void op({
+                                      op: "note_remove",
+                                      id: active.id,
+                                      noteId: n.id,
+                                    });
+                                }}
+                              >
+                                ลบ
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <form
+                        className="note-form"
+                        onSubmit={async (e) => {
+                          e.preventDefault();
+                          if (
+                            await op({
+                              op: "note",
+                              id: active.id,
+                              text: note,
+                              important,
+                            })
+                          ) {
+                            setNote("");
+                            setImportant(false);
+                          }
+                        }}
+                      >
+                        <input
+                          ref={noteInput}
+                          aria-label="ข้อความหมายเหตุ"
+                          placeholder="บันทึกอาการ การดูแล หรือข้อมูลสำคัญ…"
+                          value={note}
+                          onChange={(e) => setNote(e.target.value)}
+                          maxLength={1000}
+                          required
+                        />
+                        <label className="checkbox">
+                          <input
+                            type="checkbox"
+                            checked={important}
+                            onChange={(e) => setImportant(e.target.checked)}
+                          />
+                          สำคัญ
+                        </label>
+                        <button disabled={busy} type="submit">
+                          <Plus size={16} />
+                          บันทึก
+                        </button>
+                      </form>
+                      <div className="quick-notes">
+                        <span>อาการเปลี่ยนแปลง</span>
+                        {symptomPresets.map((text) => (
+                          <button
+                            className="symptom-chip"
+                            key={text}
+                            disabled={busy}
+                            onClick={() => {
+                              setNote((v) => (v ? v + " · " + text : text));
+                              setImportant(true);
+                              noteInput.current?.focus();
+                            }}
+                          >
+                            {text}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="quick-notes">
+                        <span>เหตุล่าช้า</span>
+                        {delayPresets.map((text) => (
+                          <button
+                            key={text}
+                            disabled={busy}
+                            onClick={() => {
+                              setNote((v) => (v ? v + " · " + text : text));
+                              noteInput.current?.focus();
+                            }}
+                          >
+                            {text}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+                  <section className="case-footer">
+                    <div>
+                      <h3>สรุปเคส / เอกสาร</h3>
+                      <p>บันทึกข้อมูลเพื่อส่งต่อและทบทวนคุณภาพการดูแล</p>
+                    </div>
+                    <div className="footer-actions">
+                      <a className="button" href={exportUrl("docx", active)}>
+                        <Download size={15} />
+                        Word
+                      </a>
+                      <button onClick={() => open("summary", active)}>
+                        คัดลอกสรุปเคส
+                      </button>
+                      <button onClick={() => open("refer", active)}>
+                        ใบส่งต่อ
+                      </button>
+                      <button onClick={() => open("outcome", active)}>
+                        ผลหลังส่งต่อ
+                      </button>
+                      <button onClick={() => open("rca", active)}>
+                        {rcaLabel(active, s.targets)}
+                      </button>
+                      <button onClick={() => open("discard", active)}>
+                        นำออกจากจอ
+                      </button>
+                      <button
+                        className="primary"
+                        disabled={busy || !connected}
+                        onClick={() => open("close", active)}
+                      >
+                        ปิดเคส <ArrowRight size={15} />
+                      </button>
+                    </div>
+                  </section>
+                </>
+              )}
+              {history}
+            </>
+          ) : (
+            <>
+              {tab === "dashboard" && (
+                <Dashboard records={records} targets={s.targets} />
+              )}
+              {history}
+            </>
+          )}
+          <footer className="app-footer">
+            <span>
+              <ShieldCheck size={13} />
+              HOSxP อ่านอย่างเดียว · ข้อมูลบันทึกบนเซิร์ฟเวอร์ของโรงพยาบาล
+            </span>
+            <span>STROKE FAST TRACK</span>
+          </footer>
+        </main>
+      </div>
+      {busy && (
+        <div className="saving">
+          <LoaderCircle size={15} className="spin" />
+          กำลังบันทึก…
+        </div>
+      )}
+      {toast && (
+        <div className="toast" role="status">
+          <Check size={16} />
+          {toast}
+        </div>
+      )}
+      {modal && (
+        <ModalShell
+          title={
+            {
+              er: linking ? "ผูกผู้ป่วยกับ VN" : "เลือกผู้ป่วยจากห้องฉุกเฉิน",
+              refer: "ใบส่งต่อ STROKE",
+              outcome: "ผลการรักษาหลังส่งต่อ",
+              rca: "ทบทวนสาเหตุและการดูแล (RCA)",
+              summary: "คัดลอกสรุปเคส",
+              settings: "ตั้งค่าระบบ",
+              ekg: "อ่านผล EKG",
+              time: "แก้ไขเวลาที่บันทึก",
+              close: "ยืนยันปิดเคส",
+              discard: "ปิดรายการที่เลือกผิด?",
+              clearLog: "ล้างประวัติเคสที่ปิดแล้วทั้งหมด?",
+            }[modal]
+          }
+          wide={modal === "ekg"}
+          locked={busy}
+          onClose={() => setModal(null)}
+        >
+          {error && (
+            <div className="error-banner" role="alert">
+              {error}
+            </div>
+          )}
+          {modal === "clearLog" ? (
+            <form
+              className="modal-body"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (
+                  await op({
+                    op: "clear_log",
+                    confirm: clearText,
+                    expectedIds: clearIds,
+                  })
+                )
+                  setModal(null);
+              }}
+            >
+              <p>
+                ลบประวัติเคสที่ปิดแล้วทั้งหมด {clearIds.length} เคส รวมหมายเหตุ
+                ใบส่งต่อ ผลติดตาม RCA และคิวที่ยังรอส่ง
+              </p>
+              <div className="notice">
+                ไม่กระทบเคสที่กำลังติดตามหรือข้อมูลใน HOSxP
+                และไม่ลบแถวที่เคยส่งไป Google Sheet แล้ว
+                การล้างประวัติย้อนคืนจากหน้านี้ไม่ได้
+              </div>
+              <label className="field">
+                พิมพ์ “ล้างประวัติ” เพื่อยืนยัน
+                <input
+                  value={clearText}
+                  onChange={(e) => setClearText(e.target.value)}
+                  autoComplete="off"
+                  required
+                />
+              </label>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setModal(null)}
+                >
+                  ยกเลิก
+                </button>
+                <button
+                  className="danger-button"
+                  disabled={busy || clearText !== "ล้างประวัติ"}
+                >
+                  ยืนยันล้างประวัติ
+                </button>
+              </div>
+            </form>
+          ) : modal === "time" && mc && editingTime ? (
+            <form
+              className="modal-body"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                // Keep the original milliseconds when the visible seconds are unchanged.
+                const original = mc.times[editingTime.key].t;
+                const t =
+                  editingTime.value === inputTime(original)
+                    ? original
+                    : parseTime(editingTime.value);
+                if (t == null || !Number.isFinite(t)) {
+                  setError("กรุณาเลือกวันที่และเวลาให้ครบ");
+                  return;
+                }
+                if (
+                  await op({ op: "stamp", id: mc.id, key: editingTime.key, t })
+                )
+                  setModal(null);
+              }}
+            >
+              <p className="form-context">
+                {mc.label} · HN {mc.hn || "รอลงทะเบียน"}
+              </p>
+              <label className="field">
+                {editingTime.label}
+                <input
+                  type="datetime-local"
+                  step="1"
+                  required
+                  value={editingTime.value}
+                  onChange={(e) =>
+                    setEditingTime({ ...editingTime, value: e.target.value })
+                  }
+                />
+              </label>
+              <p className="field-hint">
+                เลือกเวลาที่ทำจริง ระบบใช้เวลาประเทศไทย
+              </p>
+              {mc.times[editingTime.key].hosxp != null && (
+                <p className="field-hint">
+                  เวลาใน HOSxP:{" "}
+                  {thaiTime(mc.times[editingTime.key].hosxp, true)}
+                </p>
+              )}
+              <div className="modal-actions">
+                {(editingTime.key !== "door_in" || mc.vn) && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={async () => {
+                      if (
+                        await op({
+                          op: "stamp",
+                          id: mc.id,
+                          key: editingTime.key,
+                          t: null,
+                        })
+                      )
+                        setModal(null);
+                    }}
+                  >
+                    คืนค่าเดิม / HOSxP
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setModal(null)}
+                  disabled={busy}
+                >
+                  ยกเลิก
+                </button>
+                <button className="primary" disabled={busy}>
+                  บันทึกเวลา
+                </button>
+              </div>
+            </form>
+          ) : modal === "discard" && mc ? (
+            <div className="modal-body">
+              <p className="form-context">
+                {mc.label} · HN {mc.hn || "รอลงทะเบียน"}
+              </p>
+              <p>ต้องการนำผู้ป่วยรายนี้ออกจากหน้าติดตามใช่ไหม?</p>
+              <p>
+                รายการนี้จะไม่เข้า “เคสที่ปิดแล้ว” ไม่ถูกนับใน KPI และไม่ส่งไป
+                Google Sheet
+              </p>
+              <div className="notice">
+                ข้อมูลที่กรอกหรือกดเวลาไว้ในรายการนี้จะถูกลบ โดยไม่กระทบข้อมูลใน
+                HOSxP หากต้องการติดตามภายหลัง สามารถเลือกผู้ป่วยใหม่ได้
+              </div>
+              <div className="modal-actions">
+                <button disabled={busy} onClick={() => setModal(null)}>
+                  กลับไปหน้าติดตาม
+                </button>
+                <button
+                  className="danger-button"
+                  disabled={busy || !connected}
+                  onClick={async () => {
+                    if (await op({ op: "discard", id: mc.id })) {
+                      if (selected === mc.id) setSelected("");
+                      setModal(null);
+                    }
+                  }}
+                >
+                  ยืนยันนำออก
+                </button>
+              </div>
+            </div>
+          ) : modal === "close" && mc ? (
+            <div className="modal-body">
+              <p className="form-context">
+                {mc.label} · HN {mc.hn || "รอลงทะเบียน"}
+              </p>
+              <p>
+                เคสนี้จะย้ายไปที่ “เคสที่ปิดแล้ว”
+                คุณยังบันทึกผลหลังส่งต่อและทบทวน RCA ได้ภายหลัง
+              </p>
+              {steps.some(([k]) => !mc.times[k].t) && (
+                <div className="notice">
+                  ยังมีขั้นตอนที่ไม่ได้บันทึกเวลา กรุณาตรวจสอบก่อนปิดเคส
+                </div>
+              )}
+              <div className="modal-actions">
+                <button onClick={() => setModal(null)} disabled={busy}>
+                  กลับไปตรวจสอบ
+                </button>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={async () => {
+                    if (await op({ op: "close", id: mc.id })) {
+                      setSelected("");
+                      open("rca", mc);
+                    }
+                  }}
+                >
+                  ยืนยันปิดเคส
+                </button>
+              </div>
+            </div>
+          ) : modal === "er" ? (
+            <div className="modal-body">
+              <form
+                className="er-date-form"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void searchEr(erFrom, erTo);
+                }}
+              >
+                <label className="field">
+                  ตั้งแต่วันที่
+                  <input
+                    type="date"
+                    value={erFrom}
+                    max={erTo || undefined}
+                    required
+                    onChange={(e) => changeErDates(e.target.value, erTo)}
+                  />
+                </label>
+                <label className="field">
+                  ถึงวันที่
+                  <input
+                    type="date"
+                    value={erTo}
+                    min={erFrom || undefined}
+                    required
+                    onChange={(e) => changeErDates(erFrom, e.target.value)}
+                  />
+                </label>
+                <button
+                  className="primary"
+                  disabled={erLoading || !erFrom || !erTo}
+                  type="submit"
+                >
+                  <Search size={16} />
+                  ค้นหาตามวันที่
+                </button>
+                <div className="er-date-shortcuts">
+                  {(["today", "yesterday"] as const).map((key) => (
+                    <button
+                      type="button"
+                      key={key}
+                      disabled={erLoading}
+                      onClick={() => {
+                        const day = thaiDate(
+                          (now ?? Date.now()) -
+                            (key === "yesterday" ? 86400000 : 0),
+                        );
+                        changeErDates(day, day);
+                        void searchEr(day, day);
+                      }}
+                    >
+                      {key === "today" ? "วันนี้" : "เมื่อวาน"}
+                    </button>
+                  ))}
+                </div>
+              </form>
+              <p className="field-hint">
+                เลือกเฉพาะวัน · ครอบคลุมทั้งวันตั้งแต่ 00:00–23:59 น.
+                รายชื่อแสดงวันและเวลาที่มาถึง
+              </p>
+              {erHasMore && (
+                <div className="notice">
+                  พบมากกว่า 300 ราย แสดงล่าสุด 300 ราย
+                  กรุณาเลือกช่วงวันให้แคบลงเพื่อดูรายการที่เหลือ
+                </div>
+              )}
+              <label className="field">
+                ค้นหาผู้ป่วยด้วยชื่อหรือ HN
+                <input
+                  className="full"
+                  placeholder="ค้นหาชื่อ / HN"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </label>
+              <p className="field-hint">
+                เลือกชื่อเพื่อเริ่มติดตาม · รายที่มีเคสแล้วจะเลือกซ้ำไม่ได้
+              </p>
+              <div className="er-list">
+                {erLoading && <p role="status">กำลังโหลดรายชื่อผู้ป่วย…</p>}
+                {!erLoading && !erSearched && (
+                  <p className="muted">เลือกวันแล้วกด “ค้นหาตามวันที่”</p>
+                )}
+                {!erLoading &&
+                  erSearched &&
+                  !patients.some((p) => (p.name + p.hn).includes(search)) && (
+                    <p>ไม่พบผู้ป่วยที่ตรงกับคำค้น</p>
+                  )}
+                {patients
+                  .filter((p) => (p.name + p.hn).includes(search))
+                  .map((p) => (
+                    <button
+                      key={p.vn}
+                      className={p.stroke || p.suspect ? "suspect-patient" : ""}
+                      disabled={
+                        busy ||
+                        [...(s?.cases || []), ...(s?.log || [])].some(
+                          (c) => c.vn === p.vn,
+                        )
+                      }
+                      onClick={async () => {
+                        if (
+                          await op(
+                            linking
+                              ? { op: "link", id: modalId, vn: p.vn }
+                              : { op: "pin", vn: p.vn },
+                          )
+                        ) {
+                          setModal(null);
+                          setSelected("");
+                        }
+                      }}
+                    >
+                      <span>
+                        <b>{p.name}</b>
+                        {(p.stroke || p.suspect) && (
+                          <span className="tag">
+                            {p.stroke
+                              ? "มีรหัส Stroke"
+                              : "อาการเข้าข่าย · โปรดประเมิน"}
+                          </span>
+                        )}
+                        <small>
+                          HN {p.hn} · {p.age} ปี · {p.cc}
+                        </small>
+                        <small className="arrival-time">
+                          มาถึงโรงพยาบาล {thaiTime(p.door_in, true)}
+                        </small>
+                        {[...(s?.cases || []), ...(s?.log || [])].some(
+                          (c) => c.vn === p.vn,
+                        ) && <span className="tag">มีเคสในระบบแล้ว</span>}
+                      </span>
+                      <ArrowRight size={18} />
+                    </button>
+                  ))}
+              </div>
+            </div>
+          ) : modal === "settings" ? (
+            <Settings
+              targets={s?.targets || defaults}
+              save={async (value) => {
+                if (await op({ op: "targets", value })) setModal(null);
+              }}
+            />
+          ) : modal === "summary" && mc ? (
+            <div className="modal-body">
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={hide}
+                  onChange={(e) => setHide(e.target.checked)}
+                />
+                ซ่อนชื่อและ HN
+              </label>
+              <label className="field">
+                ข้อความสรุปสำหรับคัดลอก
+                <textarea rows={19} readOnly value={summary(mc, hide)} />
+              </label>
+              <button
+                className="primary"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(summary(mc, hide));
+                    setToast("คัดลอกแล้ว");
+                  } catch {
+                    setError("คัดลอกไม่ได้ กรุณาเลือกข้อความแล้วคัดลอก");
+                  }
+                }}
+              >
+                คัดลอกข้อความ
+              </button>
+              <a
+                className="button"
+                href={
+                  "https://line.me/R/msg/text/?" +
+                  encodeURIComponent(summary(mc, hide))
+                }
+                target="_blank"
+                rel="noreferrer"
+              >
+                เปิด LINE เพื่อเลือกผู้รับ
+              </a>
+              {s?.lineEnabled && (
+                <button
+                  disabled={busy}
+                  onClick={() => {
+                    if (
+                      confirm(
+                        "ยืนยันส่งสรุปเคสนี้ไปกลุ่ม LINE ที่ตั้งไว้? ข้อความจะปกปิดชื่อและ HN",
+                      )
+                    )
+                      void op({ op: "send_line", id: mc.id });
+                  }}
+                >
+                  ส่งกลุ่ม LINE ที่ตั้งไว้
+                </button>
+              )}
+            </div>
+          ) : modal === "ekg" && mc ? (
+            <iframe
+              ref={frame}
+              title="เครื่องมืออ่าน EKG"
+              src={
+                "/tools/ekg.html?" +
+                new URLSearchParams({
+                  case: mc.id,
+                  age: String(mc.patient?.age || ""),
+                  sex: mc.patient?.sex === "ชาย" ? "male" : "female",
+                  hx: mc.patient?.cc || "",
+                })
+              }
+            />
+          ) : modal === "rca" && mc ? (
+            <RcaForm
+              key={mc.id}
+              c={mc}
+              save={async (value) => {
+                const ok = await op({ op: "rca", id: mc.id, value });
+                if (ok) setModal(null);
+                return ok;
+              }}
+              exportUrl={exportUrl}
+            />
+          ) : (modal === "refer" || modal === "outcome") && mc ? (
+            <RecordForm
+              key={mc.id + modal}
+              kind={modal}
+              c={mc}
+              save={async (value) => {
+                const ok = await op({ op: modal, id: mc.id, value });
+                if (ok) setModal(null);
+                return ok;
+              }}
+              exportUrl={exportUrl}
+            />
+          ) : null}
+        </ModalShell>
+      )}
+    </div>
+  );
+}
+function minutesSince(a: number | null, b: number | null) {
+  return a != null && b != null ? Math.max(0, (b - a) / 60000) : 0;
+}
+function EditField({
+  label,
+  value,
+  save,
+  list,
+}: {
+  label: string;
+  value: string;
+  save: (v: string) => unknown;
+  list?: string[];
+}) {
+  return (
+    <label className="field">
+      {label}
+      <input
+        key={value}
+        defaultValue={value}
+        list={list ? "destinations" : undefined}
+        onBlur={(e) => {
+          if (e.target.value !== value) save(e.target.value);
+        }}
+      />
+      {list && (
+        <datalist id="destinations">
+          {list.map((v) => (
+            <option key={v}>{v}</option>
+          ))}
+        </datalist>
+      )}
+    </label>
+  );
+}
+function Settings({
+  targets,
+  save,
+}: {
+  targets: Snapshot["targets"];
+  save: (v: Snapshot["targets"]) => unknown;
+}) {
+  const [value, setValue] = useState({ ...targets }),
+    [diag, setDiag] = useState("");
+  return (
+    <form
+      className="modal-body"
+      onSubmit={(e) => {
+        e.preventDefault();
+        save(value);
+      }}
+    >
+      <p>เป้าหมายเวลานับจาก Door-in (นาที) · ตั้งตามแนวทางที่โรงพยาบาลกำหนด</p>
+      <div className="form-grid">
+        {Object.entries(targets).map(([k]) => (
+          <label className="field" key={k}>
+            {targetNames[k as TargetKey]}
+            <input
+              type="number"
+              min={1}
+              max={600}
+              required
+              value={value[k as TargetKey]}
+              onChange={(e) =>
+                setValue({ ...value, [k]: Number(e.target.value) })
+              }
+            />
+          </label>
+        ))}
+      </div>
+      <div className="modal-actions">
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              setDiag(JSON.stringify(await request("diag"), null, 2));
+            } catch (e) {
+              setDiag((e as Error).message);
+            }
+          }}
+        >
+          ตรวจการเชื่อมต่อ HOSxP
+        </button>
+        <button className="primary">บันทึกเป้าหมาย</button>
+      </div>
+      {diag && <pre>{diag}</pre>}
+      <p className="muted">
+        การเชื่อมต่อ HOSxP และ Google Sheet ตั้งใน .env.local ฝั่งเซิร์ฟเวอร์
+      </p>
+    </form>
+  );
+}
+const referFields: Record<string, string> = {
+  dest: "โรงพยาบาลปลายทาง",
+  reason: "เหตุผลส่งต่อ",
+  neuro: "ผลตรวจระบบประสาท",
+  allergy: "ประวัติแพ้ยา",
+  ekg_text: "ผล EKG",
+  meds: "ยา / ขนาด / เวลาให้",
+  bp: "ความดันโลหิต (BP)",
+  hr: "ชีพจร (HR)",
+  rr: "อัตราการหายใจ (RR)",
+  spo2: "ออกซิเจนในเลือด (SpO₂)",
+  gcs: "GCS",
+  dtx: "DTX",
+  doctor: "แพทย์ผู้ส่ง",
+  nurse: "พยาบาลผู้ส่ง",
+  phone: "โทรศัพท์",
+  prealert: "Pre-alert",
+  note: "หมายเหตุ",
+};
+function RecordForm({
+  kind,
+  c,
+  save,
+  exportUrl,
+}: {
+  kind: "refer" | "outcome";
+  c: Case;
+  save: (v: Record<string, string>) => Promise<boolean>;
+  exportUrl: (a: string, c: Case, k?: string) => string;
+}) {
+  const [value, setValue] = useState<Record<string, string>>({
+    ...(kind === "refer"
+      ? { dest: c.dest, ...c.refer }
+      : { hosp: c.dest, ...c.outcome }),
+  });
+  const [saving, setSaving] = useState(false);
+  return (
+    <form
+      className="modal-body"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+          await save(value);
+        } finally {
+          setSaving(false);
+        }
+      }}
+    >
+      <p>
+        {c.label} · HN {c.hn}
+      </p>
+      <div className="form-grid">
+        {kind === "outcome" ? (
+          <StrokeOutcome c={c} value={value} setValue={setValue} />
+        ) : (
+          Object.entries(referFields).map(([k, n]) => (
+            <label className="field" key={k}>
+              {n}
+              {["meds", "note", "ekg_text", "complication"].includes(k) ? (
+                <textarea
+                  rows={3}
+                  value={value[k] || ""}
+                  onChange={(e) => setValue({ ...value, [k]: e.target.value })}
+                  maxLength={4000}
+                />
+              ) : (
+                <input
+                  type={["fu_date", "dc_date"].includes(k) ? "date" : "text"}
+                  value={value[k] || ""}
+                  onChange={(e) => setValue({ ...value, [k]: e.target.value })}
+                  maxLength={4000}
+                />
+              )}
+            </label>
+          ))
+        )}
+      </div>
+      <div className="modal-actions">
+        {kind === "refer" && (
+          <button
+            type="button"
+            disabled={saving}
+            onClick={async () => {
+              setSaving(true);
+              try {
+                if (await save(value))
+                  window.location.href = exportUrl("docx", c, "refer");
+              } finally {
+                setSaving(false);
+              }
+            }}
+          >
+            บันทึกและดาวน์โหลด Word
+          </button>
+        )}
+        <button disabled={saving} className="primary">
+          บันทึก
+        </button>
+      </div>
+    </form>
+  );
+}
+function RcaForm({
+  c,
+  save,
+  exportUrl,
+}: {
+  c: Case;
+  save: (r: Rca) => Promise<boolean>;
+  exportUrl: (a: string, c: Case, k?: string) => string;
+}) {
+  const [r, setR] = useState<Rca>(
+    c.rca || {
+      status: "draft",
+      severity: "",
+      date: thaiDate(Date.now()),
+      summary: "",
+      root: "",
+      team: "",
+      cdp: "",
+      voices: "",
+      factors: { t0: "", t1: "", t2: "", t3: "", t4: "", t5: "" },
+      whys: ["", "", "", "", ""],
+      actions: [],
+    },
+  );
+  const [saving, setSaving] = useState(false);
+  const field = (
+    key: "summary" | "root" | "team" | "cdp" | "voices",
+    label: string,
+  ) => (
+    <label className="field">
+      {label}
+      <textarea
+        rows={3}
+        value={r[key]}
+        maxLength={4000}
+        onChange={(e) => setR({ ...r, [key]: e.target.value })}
+      />
+    </label>
+  );
+  return (
+    <form
+      className="modal-body"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+          await save(r);
+        } finally {
+          setSaving(false);
+        }
+      }}
+    >
+      <p>ทบทวนเคส · {thaiTime(c.times.door_in.t, true)}</p>
+      <div className="form-grid">
+        <label className="field">
+          วันที่ทบทวน
+          <input
+            type="date"
+            value={r.date}
+            onChange={(e) => setR({ ...r, date: e.target.value })}
+          />
+        </label>
+        <label className="field">
+          ระดับความรุนแรง
+          <select
+            value={r.severity}
+            onChange={(e) => setR({ ...r, severity: e.target.value })}
+          >
+            <option value="">เลือก</option>
+            {"ABCDEFGHI".split("").map((v) => (
+              <option key={v}>{v}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {field("summary", "1. สรุปเหตุการณ์")}
+      <details>
+        <summary>2. Timeline จากระบบ</summary>
+        {steps.map(([k, n]) => (
+          <p key={k}>
+            {n}: {thaiTime(c.times[k].t)}
+          </p>
+        ))}
+      </details>
+      {field("cdp", "3. Potential Change / Care Delivery Problems")}
+      {field("voices", "Voice of Staff")}
+      <h3>4. Contributory Factors</h3>
+      {[
+        "Active Errors",
+        "1st Tier · บุคลากร / ผู้ป่วย",
+        "2nd Tier · งาน / ทีม",
+        "3rd Tier · สภาพแวดล้อม",
+        "4th Tier · องค์กร",
+        "5th Tier · ระบบภายนอก",
+      ].map((n, i) => (
+        <label className="field" key={n}>
+          {n}
+          <textarea
+            rows={2}
+            value={r.factors["t" + i] || ""}
+            maxLength={4000}
+            onChange={(e) =>
+              setR({
+                ...r,
+                factors: { ...r.factors, ["t" + i]: e.target.value },
+              })
+            }
+          />
+        </label>
+      ))}
+      <h3>5. Five Whys</h3>
+      {r.whys.map((w, i) => (
+        <label className="field" key={i}>
+          Why {i + 1}
+          <input
+            value={w}
+            onChange={(e) =>
+              setR({
+                ...r,
+                whys: r.whys.map((v, j) => (j === i ? e.target.value : v)),
+              })
+            }
+            maxLength={4000}
+          />
+        </label>
+      ))}
+      {field("root", "สาเหตุราก")}
+      <h3>6. มาตรการแก้ไข</h3>
+      {r.actions.map((a, i) => (
+        <div className="action-card" key={i}>
+          <label className="field">
+            มาตรการ
+            <input
+              value={a.text}
+              onChange={(e) =>
+                setR({
+                  ...r,
+                  actions: r.actions.map((v, j) =>
+                    j === i ? { ...v, text: e.target.value } : v,
+                  ),
+                })
+              }
+            />
+          </label>
+          <div className="form-grid">
+            {(["strength", "owner", "due", "status"] as const).map((k) => (
+              <label className="field" key={k}>
+                {
+                  {
+                    strength: "ความเข้มแข็ง",
+                    owner: "ผู้รับผิดชอบ",
+                    due: "กำหนดเสร็จ",
+                    status: "สถานะ",
+                  }[k]
+                }
+                {k === "strength" || k === "status" ? (
+                  <select
+                    value={a[k]}
+                    onChange={(e) =>
+                      setR({
+                        ...r,
+                        actions: r.actions.map((v, j) =>
+                          j === i ? { ...v, [k]: e.target.value } : v,
+                        ),
+                      })
+                    }
+                  >
+                    {(k === "strength"
+                      ? ["strong", "intermediate", "weak"]
+                      : ["open", "done"]
+                    ).map((v) => (
+                      <option key={v}>{v}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type={k === "due" ? "date" : "text"}
+                    value={a[k]}
+                    onChange={(e) =>
+                      setR({
+                        ...r,
+                        actions: r.actions.map((v, j) =>
+                          j === i ? { ...v, [k]: e.target.value } : v,
+                        ),
+                      })
+                    }
+                  />
+                )}
+              </label>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              setR({ ...r, actions: r.actions.filter((_, j) => j !== i) })
+            }
+          >
+            ลบมาตรการ
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() =>
+          setR({
+            ...r,
+            actions: [
+              ...r.actions,
+              {
+                text: "",
+                strength: "strong",
+                owner: "",
+                due: "",
+                status: "open",
+              },
+            ],
+          })
+        }
+      >
+        <Plus size={16} />
+        เพิ่มมาตรการ
+      </button>
+      {!r.actions.some((a) => a.strength === "strong") && (
+        <p className="danger">ยังไม่มีมาตรการระดับ Strong</p>
+      )}
+      {field("team", "7. ทีมทบทวน")}
+      <label className="field">
+        สถานะ
+        <select
+          value={r.status}
+          onChange={(e) =>
+            setR({ ...r, status: e.target.value as Rca["status"] })
+          }
+        >
+          <option value="draft">ฉบับร่าง</option>
+          <option value="done">เสร็จสิ้น</option>
+        </select>
+      </label>
+      <div className="modal-actions">
+        <button
+          disabled={saving}
+          type="button"
+          onClick={async () => {
+            setSaving(true);
+            try {
+              if (await save(r))
+                window.location.href = exportUrl("docx", c, "rca");
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          Word
+        </button>
+        <button
+          disabled={saving}
+          type="button"
+          onClick={async () => {
+            setSaving(true);
+            try {
+              if (await save(r)) window.location.href = exportUrl("pptx", c);
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          PowerPoint
+        </button>
+        <button disabled={saving} className="primary">
+          บันทึก RCA
+        </button>
+      </div>
+    </form>
+  );
+}
+function Dashboard({
+  records,
+  targets,
+}: {
+  records: Case[];
+  targets: Snapshot["targets"];
+}) {
+  const stats = (k: keyof typeof metricNames) => {
+    const vs = records
+      .map((c) => metrics(c)[k])
+      .filter((v): v is number => v != null && v >= 0)
+      .sort((a, b) => a - b);
+    return {
+      count: vs.length,
+      rate: vs.length
+        ? (vs.filter((v) => v <= targets[k]).length / vs.length) * 100
+        : null,
+      median: vs.length
+        ? (vs[Math.floor((vs.length - 1) / 2)] +
+            vs[Math.ceil((vs.length - 1) / 2)]) /
+          2
+        : null,
+    };
+  };
+  const months = [
+    ...new Set(
+      records.map((c) => thaiDate(c.times.door_in.t ?? c.created).slice(0, 7)),
+    ),
+  ].sort();
+  return (
+    <>
+      <div className="dashboard-total">
+        <span>
+          เคสทั้งหมด <b>{records.length}</b>
+        </span>
+        <span>
+          RCA เสร็จ{" "}
+          <b>{records.filter((c) => c.rca?.status === "done").length}</b>
+        </span>
+        <span>
+          มาตรการค้าง{" "}
+          <b>
+            {records.reduce(
+              (n, c) =>
+                n +
+                (c.rca?.actions.filter((a) => a.status !== "done").length || 0),
+              0,
+            )}
+          </b>
+        </span>
+      </div>
+      <div className="metric-grid">
+        {(Object.keys(metricNames) as (keyof typeof metricNames)[]).map((k) => {
+          const st = stats(k);
+          return (
+            <div className="metric-card" key={k}>
+              <div className="metric-title">{metricNames[k]}</div>
+              <div className="metric-value">
+                {st.rate?.toFixed(0) ?? "—"}
+                <small>% ผ่านเป้า</small>
+              </div>
+              <div className="metric-caption">
+                Median {st.median?.toFixed(1) ?? "—"} นาที · มีเวลาครบ{" "}
+                {st.count} เคส
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <OutcomeDashboard records={records} />
+      <section className="panel monthly-panel">
+        <div className="panel-heading">
+          <h2>ร้อยละผ่านเป้ารายเดือน</h2>
+          <span className="tag">DIDO · รถออก</span>
+        </div>
+        <div className="panel-body">
+          {months.length ? (
+            months.map((month) => {
+              const vs = records
+                .filter((c) =>
+                  thaiDate(c.times.door_in.t ?? c.created).startsWith(month),
+                )
+                .map((c) => metrics(c).dido)
+                .filter((v): v is number => v != null && v >= 0);
+              const rate = vs.length
+                ? (vs.filter((v) => v <= targets.dido).length / vs.length) * 100
+                : 0;
+              return (
+                <div className="chart-row" key={month}>
+                  <span>{month}</span>
+                  <div className="progress-track">
+                    <div style={{ width: rate + "%" }} />
+                  </div>
+                  <b>{vs.length ? rate.toFixed(0) + "%" : "—"}</b>
+                </div>
+              );
+            })
+          ) : (
+            <p className="muted">กราฟจะแสดงเมื่อมีเคสที่ปิดแล้ว</p>
+          )}
+        </div>
+      </section>
+      {records.some((c) => c.rca?.actions.length) && (
+        <section className="panel monthly-panel">
+          <div className="panel-heading">
+            <h2>มาตรการที่ยังไม่เสร็จ</h2>
+          </div>
+          <div className="panel-body">
+            {records.flatMap((c) =>
+              (c.rca?.actions || [])
+                .filter((a) => a.status !== "done")
+                .map((a, i) => (
+                  <p
+                    key={c.id + i}
+                    className={
+                      a.due && a.due < thaiDate(Date.now()) ? "danger" : ""
+                    }
+                  >
+                    {a.text} · {a.owner || "ยังไม่ระบุผู้รับผิดชอบ"} ·{" "}
+                    {a.due || "ยังไม่กำหนดวัน"}
+                  </p>
+                )),
+            )}
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
